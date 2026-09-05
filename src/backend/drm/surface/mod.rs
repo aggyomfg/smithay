@@ -18,6 +18,7 @@ use super::{
     color::{Colorspace, ConnectorColorState},
     device::PlaneClaimStorage,
     error::Error,
+    gamma::GammaLutEntry,
     plane_type,
 };
 use crate::utils::DevPath;
@@ -363,6 +364,29 @@ impl DrmSurface {
                 handle: self.crtc.into(),
                 name: "VRR_ENABLED",
             }),
+        }
+    }
+
+    /// The number of entries a gamma ramp for this surface's crtc has to have, or `None`
+    /// if the crtc cannot take one.
+    ///
+    /// Asked of the hardware each time rather than cached, as the size can change with the mode.
+    pub fn gamma_size(&self) -> Result<Option<u32>, Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.gamma_size(),
+            DrmSurfaceInternal::Legacy(surf) => surf.gamma_size(),
+        }
+    }
+
+    /// Sets the hardware gamma ramp of this surface's crtc, `None` being a linear one.
+    ///
+    /// On the atomic api the ramp is staged, after a test commit has confirmed the driver
+    /// takes it, and applied by the next [`DrmSurface::commit`]; on the legacy api it is
+    /// applied immediately. `lut` has to have [`DrmSurface::gamma_size`] entries.
+    pub fn use_gamma(&self, lut: Option<&[GammaLutEntry]>) -> Result<(), Error> {
+        match &*self.internal {
+            DrmSurfaceInternal::Atomic(surf) => surf.use_gamma(lut),
+            DrmSurfaceInternal::Legacy(surf) => surf.use_gamma(lut),
         }
     }
 

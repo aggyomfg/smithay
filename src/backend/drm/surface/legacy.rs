@@ -10,6 +10,7 @@ use crate::backend::drm::error::AccessError;
 use crate::{
     backend::drm::{
         DrmDeviceFd, device::DrmDeviceInternal, device::legacy::set_connector_state, error::Error,
+        gamma::GammaLutEntry,
     },
     utils::DevPath,
 };
@@ -363,8 +364,7 @@ impl LegacyDrmSurface {
             flags |= PageFlipFlags::ASYNC;
         }
 
-        ControlDevice::page_flip(&*self.fd, self.crtc, framebuffer, flags, None)
-        .map_err(|source| {
+        ControlDevice::page_flip(&*self.fd, self.crtc, framebuffer, flags, None).map_err(|source| {
             Error::Access(AccessError {
                 errmsg: "Failed to page flip",
                 dev: self.fd.dev_path(),
@@ -469,6 +469,62 @@ impl LegacyDrmSurface {
             State::current_state(&*self.fd, self.crtc)?
         };
         Ok(())
+    }
+
+    pub fn gamma_size(&self) -> Result<Option<u32>, Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+
+        Ok(Some(self.crtc_info()?.gamma_length()).filter(|size| *size != 0))
+    }
+
+    pub fn use_gamma(&self, lut: Option<&[GammaLutEntry]>) -> Result<(), Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+
+        let size = self.crtc_info()?.gamma_length() as usize;
+        if size == 0 {
+            return Err(Error::UnknownProperty {
+                handle: self.crtc.into(),
+                name: "GAMMA_LUT",
+            });
+        }
+
+        let (red, green, blue) = match lut {
+            Some(lut) => (
+                lut.iter().map(|entry| entry.red).collect::<Vec<_>>(),
+                lut.iter().map(|entry| entry.green).collect::<Vec<_>>(),
+                lut.iter().map(|entry| entry.blue).collect::<Vec<_>>(),
+            ),
+            None => {
+                let linear = (0..size)
+                    .map(|i| (u16::MAX as usize * i / (size - 1).max(1)) as u16)
+                    .collect::<Vec<_>>();
+                (linear.clone(), linear.clone(), linear)
+            }
+        };
+
+        self.fd
+            .set_gamma(self.crtc, &red, &green, &blue)
+            .map_err(|source| {
+                Error::Access(AccessError {
+                    errmsg: "Failed to set gamma ramp",
+                    dev: self.fd.dev_path(),
+                    source,
+                })
+            })
+    }
+
+    fn crtc_info(&self) -> Result<crtc::Info, Error> {
+        self.fd.get_crtc(self.crtc).map_err(|source| {
+            Error::Access(AccessError {
+                errmsg: "Error loading crtc info",
+                dev: self.fd.dev_path(),
+                source,
+            })
+        })
     }
 
     pub(crate) fn device_fd(&self) -> &DrmDeviceFd {

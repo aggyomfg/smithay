@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 #[cfg(debug_assertions)]
 use std::fmt;
 use std::ops::RangeInclusive;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsFd, AsRawFd};
 use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicBool, Ordering},
@@ -18,6 +18,7 @@ use std::sync::{
 
 use crate::backend::drm::color::{self, Colorspace, ConnectorColorState};
 use crate::backend::drm::error::AccessError;
+use crate::backend::drm::gamma::GammaLutEntry;
 use crate::utils::{Coordinate, Rectangle, Transform};
 use crate::{
     backend::{
@@ -73,18 +74,22 @@ pub struct State {
     pub connectors: HashSet<connector::Handle>,
     pub color_state: ConnectorColorState,
     pub resolved_color: ResolvedColorState,
+    pub gamma: Option<Arc<[GammaLutEntry]>>,
+    pub gamma_blob: property::Value<'static>,
 }
 
 impl PartialEq for State {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         // `resolved_color` is derived from `color_state` (and owns the metadata blob), so like
-        // the mode blob it is excluded from the comparison.
+        // the mode blob it is excluded from the comparison. `gamma_blob` stands to `gamma` in
+        // the same relation.
         self.active == other.active
             && self.mode == other.mode
             && self.vrr == other.vrr
             && self.connectors == other.connectors
             && self.color_state == other.color_state
+            && self.gamma == other.gamma
     }
 }
 
@@ -243,6 +248,8 @@ impl State {
             // We don't own the current metadata blob (if any), so don't reference it here;
             // requests are only ever built from the pending state anyway.
             resolved_color: ResolvedColorState::default(),
+            gamma: None,
+            gamma_blob: property::Value::Blob(0),
         })
     }
 
@@ -254,6 +261,8 @@ impl State {
         self.vrr = false;
         self.color_state = ConnectorColorState::default();
         self.resolved_color = ResolvedColorState::default();
+        self.gamma = None;
+        self.gamma_blob = property::Value::Blob(0);
     }
 }
 
@@ -349,6 +358,28 @@ fn resolve_color_state<A: DevPath + ControlDevice>(
     Ok(resolved)
 }
 
+pub(in crate::backend::drm) fn gamma_lut_size<A: DevPath + ControlDevice>(
+    fd: &A,
+    crtc: crtc::Handle,
+) -> Result<Option<u32>, Error> {
+    let props = fd.get_properties(crtc).map_err(|source| {
+        Error::Access(AccessError {
+            errmsg: "Error querying crtc properties",
+            dev: fd.dev_path(),
+            source,
+        })
+    })?;
+
+    for (prop, raw) in props {
+        let Ok(info) = fd.get_property(prop) else { continue };
+        if info.name().to_str() == Ok("GAMMA_LUT_SIZE") {
+            return Ok(u32::try_from(raw).ok().filter(|size| *size != 0));
+        }
+    }
+
+    Ok(None)
+}
+
 #[derive(Debug)]
 pub struct AtomicDrmSurface {
     pub(in crate::backend::drm) fd: Arc<DrmDeviceInternal>,
@@ -406,6 +437,8 @@ impl AtomicDrmSurface {
             connectors: connectors.iter().copied().collect(),
             color_state,
             resolved_color,
+            gamma: None,
+            gamma_blob: property::Value::Blob(0),
         };
 
         drop(_guard);
@@ -575,6 +608,7 @@ impl AtomicDrmSurface {
                 self.crtc,
                 Some(pending.blob),
                 pending.vrr,
+                Some(pending.gamma_blob),
                 Some(&resolved_color),
                 &connectors,
                 [],
@@ -636,6 +670,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             pending.vrr,
+            Some(pending.gamma_blob),
             Some(&pending.resolved_color),
             &connectors,
             [&conn],
@@ -704,6 +739,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             pending.vrr,
+            Some(pending.gamma_blob),
             Some(&resolved_color),
             &conns,
             removed,
@@ -760,6 +796,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(new_blob),
             pending.vrr,
+            Some(pending.gamma_blob),
             Some(&pending.resolved_color),
             pending.connectors.iter(),
             [],
@@ -884,6 +921,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             value,
+            Some(pending.gamma_blob),
             Some(&pending.resolved_color),
             &pending.connectors,
             &[],
@@ -913,6 +951,112 @@ impl AtomicDrmSurface {
 
         pending.vrr = value;
         Ok(())
+    }
+
+    pub fn gamma_size(&self) -> Result<Option<u32>, Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+
+        gamma_lut_size(&*self.fd, self.crtc)
+    }
+
+    pub fn use_gamma(&self, lut: Option<&[GammaLutEntry]>) -> Result<(), Error> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Err(Error::DeviceInactive);
+        }
+
+        let current = self.state.read().unwrap();
+        let mut pending = self.pending.write().unwrap();
+        if pending.gamma.as_deref() == lut {
+            return Ok(());
+        }
+
+        let prop_mapping = self.prop_mapping.read().unwrap();
+        if prop_mapping.crtc_prop_handle(self.crtc, "GAMMA_LUT").is_err() {
+            return Err(Error::UnknownProperty {
+                handle: self.crtc.into(),
+                name: "GAMMA_LUT",
+            });
+        }
+
+        let destroy_blob = |blob: property::Value<'static>| {
+            if let property::Value::Blob(id) = blob {
+                if id != 0 {
+                    if let Err(err) = self.fd.destroy_property_blob(id) {
+                        warn!("Failed to destroy gamma ramp property blob: {}", err);
+                    }
+                }
+            }
+        };
+
+        let blob = match lut {
+            Some(lut) => self.create_gamma_blob(lut)?,
+            None => property::Value::Blob(0),
+        };
+
+        let res = (|| {
+            let test_buffer = self.create_test_buffer(pending.mode.size(), self.plane)?;
+            let plane_config = PlaneState {
+                handle: self.plane,
+                config: Some(PlaneConfig {
+                    src: Rectangle::from_size(pending.mode.size().into()).to_f64(),
+                    dst: Rectangle::from_size(
+                        (pending.mode.size().0 as i32, pending.mode.size().1 as i32).into(),
+                    ),
+                    transform: Transform::Normal,
+                    alpha: 1.0,
+                    damage_clips: None,
+                    fb: test_buffer.fb,
+                    fence: None,
+                }),
+            };
+
+            let req = AtomicRequest::build_request(
+                &prop_mapping,
+                self.crtc,
+                Some(pending.blob),
+                pending.vrr,
+                Some(blob),
+                Some(&pending.resolved_color),
+                &pending.connectors,
+                &[],
+                [&plane_config],
+            )?;
+
+            self.fd
+                .atomic_commit(
+                    AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
+                    req.build()?,
+                )
+                .map_err(|_| Error::TestFailed(self.crtc))
+        })();
+
+        if let Err(err) = res {
+            destroy_blob(blob);
+            return Err(err);
+        }
+
+        let old_blob = std::mem::replace(&mut pending.gamma_blob, blob);
+        if old_blob != current.gamma_blob {
+            destroy_blob(old_blob);
+        }
+
+        pending.gamma = lut.map(Arc::from);
+        Ok(())
+    }
+
+    fn create_gamma_blob(&self, lut: &[GammaLutEntry]) -> Result<property::Value<'static>, Error> {
+        let mut data = lut.iter().flat_map(GammaLutEntry::to_kernel_bytes).collect::<Vec<u8>>();
+        let blob = drm_ffi::mode::create_property_blob(self.fd.as_fd(), &mut data).map_err(|source| {
+            Error::Access(AccessError {
+                errmsg: "Failed to create gamma ramp property blob",
+                dev: self.fd.dev_path(),
+                source,
+            })
+        })?;
+
+        Ok(property::Value::Blob(blob.blob_id as u64))
     }
 
     /// Returns the colorspaces supported by the given connector's `Colorspace` property.
@@ -1092,6 +1236,7 @@ impl AtomicDrmSurface {
                 self.crtc,
                 Some(pending.blob),
                 pending.vrr,
+                Some(pending.gamma_blob),
                 Some(&resolved),
                 &pending.connectors,
                 &[],
@@ -1163,6 +1308,7 @@ impl AtomicDrmSurface {
             self.crtc,
             Some(pending.blob),
             pending.vrr,
+            Some(pending.gamma_blob),
             Some(&pending.resolved_color),
             &pending_conns,
             removed,
@@ -1236,6 +1382,7 @@ impl AtomicDrmSurface {
                 self.crtc,
                 Some(pending.blob),
                 pending.vrr,
+                Some(pending.gamma_blob),
                 Some(&pending.resolved_color),
                 &pending_conns,
                 removed,
@@ -1262,6 +1409,15 @@ impl AtomicDrmSurface {
                         if id != 0 {
                             if let Err(err) = self.fd.destroy_property_blob(id) {
                                 warn!("Failed to destroy old HDR metadata property blob: {}", err);
+                            }
+                        }
+                    }
+                }
+                if current.gamma_blob != pending.gamma_blob {
+                    if let property::Value::Blob(id) = current.gamma_blob {
+                        if id != 0 {
+                            if let Err(err) = self.fd.destroy_property_blob(id) {
+                                warn!("Failed to destroy old gamma ramp property blob: {}", err);
                             }
                         }
                     }
@@ -1334,11 +1490,14 @@ impl AtomicDrmSurface {
         // Connector color properties are deliberately omitted (`None`): the kernel latches
         // them from the last commit, and re-emitting connector state on every flip makes the
         // kernel re-run its modeset checks and can cause sinks to renegotiate infoframes.
+        // The gamma ramp is left out for the same reason: the kernel keeps the last
+        // committed `GAMMA_LUT`, and a flip has nothing new to say about it.
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
             None,
             self.state.read().unwrap().vrr,
+            None,
             None,
             [],
             [],
@@ -1374,16 +1533,13 @@ impl AtomicDrmSurface {
         // If we would set anything here, that would require a modeset, this would fail,
         // indicating a problem in our assumptions.
         trace!(?planes, tearing, "Queueing page flip: {:?}", req);
-        let res = self
-            .fd
-            .atomic_commit(flags, req.build()?)
-            .map_err(|source| {
-                Error::Access(AccessError {
-                    errmsg: "Page flip commit failed",
-                    dev: self.fd.dev_path(),
-                    source,
-                })
-            });
+        let res = self.fd.atomic_commit(flags, req.build()?).map_err(|source| {
+            Error::Access(AccessError {
+                errmsg: "Page flip commit failed",
+                dev: self.fd.dev_path(),
+                source,
+            })
+        });
 
         if res.is_ok() {
             for plane in planes.iter() {
@@ -1511,6 +1667,16 @@ impl AtomicDrmSurface {
                     })
                 })?;
             let old_blob = std::mem::replace(&mut pending.resolved_color.hdr_blob, hdr_blob);
+            if let property::Value::Blob(id) = old_blob {
+                if id != 0 {
+                    let _ = self.fd.destroy_property_blob(id);
+                }
+            }
+        }
+
+        if let Some(lut) = pending.gamma.clone() {
+            let gamma_blob = self.create_gamma_blob(&lut)?;
+            let old_blob = std::mem::replace(&mut pending.gamma_blob, gamma_blob);
             if let property::Value::Blob(id) = old_blob {
                 if id != 0 {
                     let _ = self.fd.destroy_property_blob(id);
@@ -1711,6 +1877,7 @@ impl<'a> AtomicRequest<'a> {
         crtc: crtc::Handle,
         mode: Option<property::Value<'static>>,
         vrr: bool,
+        gamma: Option<property::Value<'static>>,
     ) -> Result<(), Error> {
         let crtc_props = self.crtc_props.entry(crtc).or_default();
 
@@ -1726,6 +1893,16 @@ impl<'a> AtomicRequest<'a> {
                 name: "VRR_ENABLED",
             });
         }
+        if let Some(gamma) = gamma {
+            if self.mapping.crtc_prop_handle(crtc, "GAMMA_LUT").is_ok() {
+                crtc_props.insert("GAMMA_LUT", gamma);
+            } else if gamma != property::Value::Blob(0) {
+                return Err(Error::UnknownProperty {
+                    handle: crtc.into(),
+                    name: "GAMMA_LUT",
+                });
+            }
+        }
 
         Ok(())
     }
@@ -1737,6 +1914,9 @@ impl<'a> AtomicRequest<'a> {
         crtc_props.insert("MODE_ID", property::Value::Blob(0));
         if self.mapping.crtc_prop_handle(crtc, "VRR_ENABLED").is_ok() {
             crtc_props.insert("VRR_ENABLED", property::Value::Boolean(false));
+        }
+        if self.mapping.crtc_prop_handle(crtc, "GAMMA_LUT").is_ok() {
+            crtc_props.insert("GAMMA_LUT", property::Value::Blob(0));
         }
         Ok(())
     }
@@ -1945,6 +2125,7 @@ impl<'a> AtomicRequest<'a> {
         crtc: crtc::Handle,
         mode: Option<property::Value<'static>>,
         vrr: bool,
+        gamma: Option<property::Value<'static>>,
     ) -> Result<(), Error> {
         if let Some(blob) = mode {
             self.request
@@ -1967,6 +2148,17 @@ impl<'a> AtomicRequest<'a> {
             });
         }
 
+        if let Some(gamma) = gamma {
+            if let Ok(gamma_prop) = self.mapping.crtc_prop_handle(crtc, "GAMMA_LUT") {
+                self.request.add_property(crtc, gamma_prop, gamma);
+            } else if gamma != property::Value::Blob(0) {
+                return Err(Error::UnknownProperty {
+                    handle: crtc.into(),
+                    name: "GAMMA_LUT",
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -1984,6 +2176,10 @@ impl<'a> AtomicRequest<'a> {
         if let Ok(prop) = self.mapping.crtc_prop_handle(crtc, "VRR_ENABLED") {
             self.request
                 .add_property(crtc, prop, property::Value::Boolean(false));
+        }
+        // Like the connector's color signalling: leave the next KMS client a linear ramp.
+        if let Ok(prop) = self.mapping.crtc_prop_handle(crtc, "GAMMA_LUT") {
+            self.request.add_property(crtc, prop, property::Value::Blob(0));
         }
         Ok(())
     }
@@ -2199,6 +2395,7 @@ impl<'a> AtomicRequest<'a> {
         crtc: crtc::Handle,
         blob: Option<property::Value<'static>>,
         vrr: bool,
+        gamma: Option<property::Value<'static>>,
         color: Option<&ResolvedColorState>,
         connectors: impl IntoIterator<Item = &'a connector::Handle>,
         removed_connectors: impl IntoIterator<Item = &'a connector::Handle>,
@@ -2223,8 +2420,8 @@ impl<'a> AtomicRequest<'a> {
             req.reset_connector(*conn)?;
         }
 
-        // Set the crtc properties (active, mode_id, vrr_enabled).
-        req.set_crtc(crtc, blob, vrr)?;
+        // Set the crtc properties (active, mode_id, vrr_enabled, gamma_lut).
+        req.set_crtc(crtc, blob, vrr, gamma)?;
 
         for plane_state in planes.into_iter() {
             req.set_plane(crtc, plane_state)?;

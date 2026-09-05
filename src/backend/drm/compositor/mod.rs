@@ -180,6 +180,7 @@ use super::{
     color::{Colorspace, ConnectorColorState},
     error::AccessError,
     exporter::{ExportBuffer, ExportFramebuffer, gbm::GbmFramebufferExporter, gbm::NodeFilter},
+    gamma::GammaLutEntry,
     surface::VrrSupport,
 };
 
@@ -2798,6 +2799,20 @@ where
     /// used without a modeset on the attached connectors.
     pub fn use_vrr(&mut self, vrr: bool) -> FrameResult<(), A, F> {
         self.surface.use_vrr(vrr).map_err(FrameError::DrmError)
+    }
+
+    /// The number of entries a gamma ramp for this compositor's crtc has to have.
+    ///
+    /// See [`DrmSurface::gamma_size`] for more details.
+    pub fn gamma_size(&self) -> FrameResult<Option<u32>, A, F> {
+        self.surface.gamma_size().map_err(FrameError::DrmError)
+    }
+
+    /// Sets the hardware gamma ramp of this compositor's crtc, `None` being a linear one.
+    ///
+    /// See [`DrmSurface::use_gamma`] for more details.
+    pub fn use_gamma(&mut self, lut: Option<&[GammaLutEntry]>) -> FrameResult<(), A, F> {
+        self.surface.use_gamma(lut).map_err(FrameError::DrmError)
     }
 
     /// Returns the colorspaces supported by the given connector's `Colorspace` property.

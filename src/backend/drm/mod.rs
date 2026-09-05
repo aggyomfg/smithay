@@ -78,6 +78,7 @@ pub(crate) mod device;
 pub mod dumb;
 mod error;
 pub mod exporter;
+pub mod gamma;
 #[cfg(feature = "backend_gbm")]
 pub mod gbm;
 #[cfg(all(feature = "wayland_frontend", feature = "backend_gbm"))]
@@ -97,6 +98,7 @@ pub use drm::node::{CreateDrmNodeError, DrmNode, NodeType};
 use drm_fourcc::{DrmFormat, DrmFourcc, DrmModifier};
 pub use error::AccessError as DrmAccessError;
 pub use error::Error as DrmError;
+pub use gamma::GammaLutEntry;
 use indexmap::IndexSet;
 #[cfg(feature = "backend_gbm")]
 pub use surface::gbm::{Error as GbmBufferedSurfaceError, GbmBufferedSurface};

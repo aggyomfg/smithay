@@ -271,6 +271,29 @@ impl DrmDevice {
         self.resources.crtcs()
     }
 
+    /// The number of entries a gamma ramp for the given crtc has to have.
+    ///
+    /// `None` if the crtc cannot take a ramp at all. This asks the device rather than a
+    /// [`DrmSurface`](super::DrmSurface), so it answers for a crtc that has none — a screen
+    /// that is currently off.
+    pub fn gamma_size(&self, crtc: crtc::Handle) -> Result<Option<u32>, Error> {
+        match &*self.internal {
+            DrmDeviceInternal::Atomic(_) => super::surface::atomic::gamma_lut_size(&*self.internal, crtc),
+            DrmDeviceInternal::Legacy(_) => Ok(Some(
+                self.get_crtc(crtc)
+                    .map_err(|source| {
+                        Error::Access(AccessError {
+                            errmsg: "Error loading crtc info",
+                            dev: self.dev_path(),
+                            source,
+                        })
+                    })?
+                    .gamma_length(),
+            )
+            .filter(|size| *size != 0)),
+        }
+    }
+
     /// Returns a set of available planes for a given crtc
     pub fn planes(&self, crtc: &crtc::Handle) -> Result<Planes, Error> {
         planes(self, crtc, self.has_universal_planes)
