@@ -50,7 +50,7 @@ use crate::{
     backend::{
         allocator::{
             Buffer, Format, Fourcc,
-            dmabuf::{Dmabuf, WeakDmabuf},
+            dmabuf::{Dmabuf, WeakDmabuf, YuvEncoding},
             format::{FormatSet, get_bpp, get_opaque, has_alpha},
         },
         egl::{
@@ -398,7 +398,7 @@ pub struct GlesRenderer {
 
     // caches
     buffers: Vec<GlesBuffer>,
-    dmabuf_cache: HashMap<WeakDmabuf, GlesTexture>,
+    dmabuf_cache: HashMap<WeakDmabuf, (GlesTexture, YuvEncoding)>,
     vbos: [ffi::types::GLuint; 2],
     vertices: Vec<f32>,
     non_opaque_damage: Vec<Rectangle<i32, Physical>>,
@@ -1303,7 +1303,8 @@ impl ImportDma for GlesRenderer {
                 egl_images: Some(vec![image]),
                 destruction_callback_sender: self.gles_cleanup().sender.clone(),
             }));
-            self.dmabuf_cache.insert(buffer.weak(), texture.clone());
+            self.dmabuf_cache
+                .insert(buffer.weak(), (texture.clone(), buffer.yuv_encoding()));
             Ok(texture)
         })
     }
@@ -1323,9 +1324,13 @@ impl ImportDmaWl for GlesRenderer {}
 impl GlesRenderer {
     #[profiling::function]
     fn existing_dmabuf_texture(&self, buffer: &Dmabuf) -> Result<Option<GlesTexture>, GlesError> {
-        let Some(texture) = self.dmabuf_cache.get(&buffer.weak()) else {
+        let Some((texture, encoding)) = self.dmabuf_cache.get(&buffer.weak()) else {
             return Ok(None);
         };
+        if *encoding != buffer.yuv_encoding() {
+            trace!("Re-importing {:?} for a changed YUV encoding", buffer);
+            return Ok(None);
+        }
 
         trace!("Re-using texture {:?} for {:?}", texture.0.texture, buffer);
         if let Some(egl_images) = texture.0.egl_images.as_ref() {

@@ -22,7 +22,6 @@ use crate::utils::{Buffer as BufferCoords, Size};
 use crate::wayland::compositor::{Blocker, BlockerState};
 use std::hash::{Hash, Hasher};
 use std::os::unix::io::{AsFd, BorrowedFd, OwnedFd};
-#[cfg(feature = "backend_drm")]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -50,6 +49,54 @@ pub(crate) struct DmabufInternal {
     /// This is inferred from client apis, however there is no kernel api or guarantee this is correct
     #[cfg(feature = "backend_drm")]
     node: Mutex<Option<DrmNode>>,
+    /// How the YCbCr channels of this buffer are to be converted to RGB
+    yuv_encoding: Mutex<YuvEncoding>,
+}
+
+/// Matrix coefficients a YCbCr buffer is encoded with
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum YuvMatrix {
+    /// ITU-R BT.601
+    Bt601,
+    /// ITU-R BT.709
+    Bt709,
+    /// ITU-R BT.2020 (non-constant luminance)
+    Bt2020,
+}
+
+/// Quantization range of a YCbCr buffer
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum YuvRange {
+    /// Full range
+    Full,
+    /// Limited ("narrow") range
+    Limited,
+}
+
+/// Offset of subsampled chroma samples from the first luma sample, along one axis
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChromaSiting {
+    /// Co-sited with the luma sample
+    Cosited,
+    /// Half-way to the next luma sample
+    Midpoint,
+}
+
+/// How the YCbCr channels of a dmabuf are to be converted to RGB.
+///
+/// Every field left `None` is left to the importing driver, which is what an import
+/// without any of this does. Only meaningful for YCbCr formats; leave it at its default
+/// for any other, as its hints are passed to the driver unconditionally.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct YuvEncoding {
+    /// Matrix coefficients
+    pub matrix: Option<YuvMatrix>,
+    /// Quantization range
+    pub range: Option<YuvRange>,
+    /// Horizontal chroma siting
+    pub horizontal_siting: Option<ChromaSiting>,
+    /// Vertical chroma siting
+    pub vertical_siting: Option<ChromaSiting>,
 }
 
 #[derive(Debug)]
@@ -201,6 +248,7 @@ impl Dmabuf {
                 flags,
                 #[cfg(feature = "backend_drm")]
                 node: Mutex::new(None),
+                yuv_encoding: Mutex::new(YuvEncoding::default()),
             },
         }
     }
@@ -262,6 +310,19 @@ impl Dmabuf {
     #[cfg(feature = "backend_drm")]
     pub fn set_node(&self, node: impl Into<Option<DrmNode>>) {
         *self.0.node.lock().unwrap() = node.into();
+    }
+
+    /// How the YCbCr channels of this buffer are to be converted to RGB.
+    pub fn yuv_encoding(&self) -> YuvEncoding {
+        *self.0.yuv_encoding.lock().unwrap()
+    }
+
+    /// Sets how the YCbCr channels of this buffer are to be converted to RGB.
+    ///
+    /// Renderers import a buffer again the next time it is imported with an
+    /// encoding different from the one its cached texture was created with.
+    pub fn set_yuv_encoding(&self, encoding: YuvEncoding) {
+        *self.0.yuv_encoding.lock().unwrap() = encoding;
     }
 
     /// Create an [`calloop::EventSource`] and [`Blocker`] for this [`Dmabuf`].

@@ -24,7 +24,10 @@ use crate::backend::egl::EGLDevice;
 use crate::backend::egl::{BufferAccessError, EGLBuffer, Format};
 use crate::{
     backend::{
-        allocator::{Buffer as _, Format as DrmFormat, Fourcc, Modifier, dmabuf::Dmabuf},
+        allocator::{
+            Buffer as _, Format as DrmFormat, Fourcc, Modifier,
+            dmabuf::{ChromaSiting, Dmabuf, YuvEncoding, YuvMatrix, YuvRange},
+        },
         egl::{
             EGLError, Error,
             context::{GlAttributes, PixelFormatRequirements},
@@ -824,6 +827,7 @@ impl EGLDisplay {
             }
         }
 
+        out.extend(yuv_hints(dmabuf.yuv_encoding()));
         out.push(ffi::egl::NONE as i32);
 
         unsafe {
@@ -1277,4 +1281,53 @@ impl DamageSupport {
     pub fn supported(&self) -> bool {
         self != &DamageSupport::No
     }
+}
+
+/// The `EGL_EXT_image_dma_buf_import` hint attributes describing `encoding`.
+fn yuv_hints(encoding: YuvEncoding) -> impl Iterator<Item = c_int> {
+    let matrix = encoding.matrix.map(|matrix| {
+        [
+            ffi::egl::YUV_COLOR_SPACE_HINT_EXT as c_int,
+            match matrix {
+                YuvMatrix::Bt601 => ffi::egl::ITU_REC601_EXT,
+                YuvMatrix::Bt709 => ffi::egl::ITU_REC709_EXT,
+                YuvMatrix::Bt2020 => ffi::egl::ITU_REC2020_EXT,
+            } as c_int,
+        ]
+    });
+    let range = encoding.range.map(|range| {
+        [
+            ffi::egl::SAMPLE_RANGE_HINT_EXT as c_int,
+            match range {
+                YuvRange::Full => ffi::egl::YUV_FULL_RANGE_EXT,
+                YuvRange::Limited => ffi::egl::YUV_NARROW_RANGE_EXT,
+            } as c_int,
+        ]
+    });
+    let siting = |attribute: u32, siting: Option<ChromaSiting>| {
+        siting.map(|siting| {
+            [
+                attribute as c_int,
+                match siting {
+                    ChromaSiting::Cosited => ffi::egl::YUV_CHROMA_SITING_0_EXT,
+                    ChromaSiting::Midpoint => ffi::egl::YUV_CHROMA_SITING_0_5_EXT,
+                } as c_int,
+            ]
+        })
+    };
+    [
+        matrix,
+        range,
+        siting(
+            ffi::egl::YUV_CHROMA_HORIZONTAL_SITING_HINT_EXT,
+            encoding.horizontal_siting,
+        ),
+        siting(
+            ffi::egl::YUV_CHROMA_VERTICAL_SITING_HINT_EXT,
+            encoding.vertical_siting,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .flatten()
 }
